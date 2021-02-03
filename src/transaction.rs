@@ -199,6 +199,8 @@ impl<'env> Transaction for RoTransaction<'env> {
     }
 }
 
+unsafe impl<'env> Send for RoTransaction<'env> {}
+
 /// An inactive read-only transaction.
 pub struct InactiveTransaction<'env> {
     txn: *mut ffi::MDB_txn,
@@ -417,6 +419,8 @@ impl<'env> Transaction for RwTransaction<'env> {
         self.txn
     }
 }
+
+unsafe impl<'env> Send for RwTransaction<'env> {}
 
 #[cfg(test)]
 mod test {
