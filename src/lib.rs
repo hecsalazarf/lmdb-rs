@@ -48,6 +48,11 @@ macro_rules! lmdb_try {
     }};
 }
 
+/// LMDB ffi bindings.
+pub mod sys {
+  pub use ffi::*;
+}
+
 macro_rules! lmdb_try_with_cleanup {
     ($expr:expr, $cleanup:expr) => {{
         match $expr {
