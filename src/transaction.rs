@@ -272,14 +272,6 @@ impl<'env> RwTransaction<'env> {
         }
     }
 
-    /// Returns a raw pointer to the underlying LMDB read-write transaction.
-    ///
-    /// The caller must ensure that the pointer is not dereferenced after the
-    /// lifetime of the environment.
-    pub fn rw_txn(&self) -> *mut ffi::MDB_txn {
-        self.txn
-    }
-
     /// Opens a database in the provided transaction, creating it if necessary.
     ///
     /// If `name` is `None`, then the default database will be opened, otherwise
