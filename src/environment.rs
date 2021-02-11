@@ -267,6 +267,22 @@ impl Environment {
     pub fn set_map_size(&self, size: size_t) -> Result<()> {
         unsafe { lmdb_result(ffi::mdb_env_set_mapsize(self.env(), size)) }
     }
+
+    /// Copy an LMDB environment to the specified path.
+    ///
+    /// This function may be used to make a backup of an existing environment. No lockfile
+    /// is created, since it gets recreated at need.
+    ///
+    /// # Note
+    /// This call can trigger significant file size growth if run in parallel with write
+    /// transactions, because it employs a read-only transaction.
+    pub fn copy<P>(&self, path: P) -> Result<()>
+    where
+        P: AsRef<Path>,
+    {
+        let path = CString::new(path.as_ref().as_os_str().as_bytes()).map_err(|_| ::Error::Invalid)?;
+        unsafe { lmdb_result(ffi::mdb_env_copy(self.env(), path.as_ptr())) }
+    }
 }
 
 /// Environment statistics.
@@ -676,5 +692,26 @@ mod test {
         env.set_map_size(2 * default_size).unwrap();
         info = env.info().unwrap();
         assert_eq!(info.map_size(), 2 * default_size);
+    }
+
+    #[test]
+    fn test_copy() {
+        use std::fs::File;
+        use std::io::Read;
+
+        let dir = TempDir::new("test").unwrap();
+        let dir_copy = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        env.copy(dir_copy.path()).unwrap();
+
+        let mut buffer = Vec::new();
+        let mut buffer_copy = Vec::new();
+
+        let mut env_file = File::open(dir.path().join("data.mdb")).unwrap();
+        let mut env_file_copy = File::open(dir_copy.path().join("data.mdb")).unwrap();
+        env_file.read_to_end(&mut buffer).unwrap();
+        env_file_copy.read_to_end(&mut buffer_copy).unwrap();
+
+        assert_eq!(buffer, buffer_copy);
     }
 }
