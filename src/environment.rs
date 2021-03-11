@@ -31,6 +31,7 @@ use error::{
     Result,
 };
 use flags::{
+    CopyFlags,
     DatabaseFlags,
     EnvironmentFlags,
 };
@@ -276,12 +277,12 @@ impl Environment {
     /// # Note
     /// This call can trigger significant file size growth if run in parallel with write
     /// transactions, because it employs a read-only transaction.
-    pub fn copy<P>(&self, path: P) -> Result<()>
+    pub fn copy<P>(&self, path: P, flags: CopyFlags) -> Result<()>
     where
         P: AsRef<Path>,
     {
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).map_err(|_| ::Error::Invalid)?;
-        unsafe { lmdb_result(ffi::mdb_env_copy(self.env(), path.as_ptr())) }
+        unsafe { lmdb_result(ffi::mdb_env_copy2(self.env(), path.as_ptr(), flags.bits())) }
     }
 }
 
@@ -698,20 +699,49 @@ mod test {
     fn test_copy() {
         use std::fs::File;
         use std::io::Read;
+        const ENTRIES: u32 = 100;
 
         let dir = TempDir::new("test").unwrap();
         let dir_copy = TempDir::new("test").unwrap();
+        let dir_copy_comp = TempDir::new("test").unwrap();
         let env = Environment::new().open(dir.path()).unwrap();
-        env.copy(dir_copy.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        // Add some entries
+        let mut tx = env.begin_rw_txn().unwrap();
+        for kv in 0..ENTRIES {
+            let value = kv.to_be_bytes();
+            tx.put(db, &value, &value, WriteFlags::default()).unwrap();
+        }
+        tx.commit().unwrap();
+
+        // Remove the same entries to see compaction
+        let mut tx = env.begin_rw_txn().unwrap();
+        for kv in 0..ENTRIES {
+            let value = kv.to_be_bytes();
+            tx.del(db, &value, None).unwrap();
+        }
+        tx.commit().unwrap();
+
+        // Default copy
+        env.copy(dir_copy.path(), CopyFlags::default()).unwrap();
+        // Copy with compaction
+        env.copy(dir_copy_comp.path(), CopyFlags::CP_COMPACT).unwrap();
 
         let mut buffer = Vec::new();
         let mut buffer_copy = Vec::new();
+        let mut buffer_copy_comp = Vec::new();
 
         let mut env_file = File::open(dir.path().join("data.mdb")).unwrap();
         let mut env_file_copy = File::open(dir_copy.path().join("data.mdb")).unwrap();
+        let mut env_file_copy_comp = File::open(dir_copy_comp.path().join("data.mdb")).unwrap();
         env_file.read_to_end(&mut buffer).unwrap();
         env_file_copy.read_to_end(&mut buffer_copy).unwrap();
+        env_file_copy_comp.read_to_end(&mut buffer_copy_comp).unwrap();
 
+        // Default copy is the same as the original environment
         assert_eq!(buffer, buffer_copy);
+        // The compacted copy is smaller than the default one
+        assert!(buffer_copy_comp < buffer_copy);
     }
 }

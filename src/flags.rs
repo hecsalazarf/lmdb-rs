@@ -171,3 +171,15 @@ bitflags! {
         const APPEND_DUP = MDB_APPENDDUP;
     }
 }
+
+bitflags! {
+    #[doc="Copy options."]
+    #[derive(Default)]
+    pub struct CopyFlags: c_uint {
+
+        #[doc = "Perform compaction while copying: omit free"]
+        #[doc = "pages and sequentially renumber all pages in output. This option"]
+        #[doc = "consumes more CPU and runs more slowly than the default."]
+        const CP_COMPACT = MDB_CP_COMPACT;
+    }
+}
