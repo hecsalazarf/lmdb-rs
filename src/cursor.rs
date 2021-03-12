@@ -1,4 +1,8 @@
 use std::marker::PhantomData;
+use std::ops::{
+    Bound,
+    RangeBounds,
+};
 use std::{
     fmt,
     mem,
@@ -58,7 +62,7 @@ pub trait Cursor<'txn> {
     /// duplicate data items of each key will be returned before moving on to
     /// the next key.
     fn iter(&mut self) -> Iter<'txn> {
-        Iter::new(self.cursor(), ffi::MDB_NEXT, ffi::MDB_NEXT)
+        Iter::new(self.cursor(), ffi::MDB_NEXT, ffi::MDB_NEXT, Bound::Unbounded)
     }
 
     /// Iterate over database items backwards. The iterator will begin with item
@@ -69,7 +73,7 @@ pub trait Cursor<'txn> {
     /// duplicate data items of each key will be returned before moving on to
     /// the next key.
     fn iter_backwards(&mut self) -> Iter<'txn> {
-        Iter::new(self.cursor(), ffi::MDB_PREV, ffi::MDB_PREV)
+        Iter::new(self.cursor(), ffi::MDB_PREV, ffi::MDB_PREV, Bound::Unbounded)
     }
 
     /// Iterate over database items starting from the beginning of the database.
@@ -78,7 +82,7 @@ pub trait Cursor<'txn> {
     /// duplicate data items of each key will be returned before moving on to
     /// the next key.
     fn iter_start(&mut self) -> Iter<'txn> {
-        Iter::new(self.cursor(), ffi::MDB_FIRST, ffi::MDB_NEXT)
+        Iter::new(self.cursor(), ffi::MDB_FIRST, ffi::MDB_NEXT, Bound::Unbounded)
     }
 
     /// Iterate backwards over database items starting from the end of the database.
@@ -87,7 +91,7 @@ pub trait Cursor<'txn> {
     /// duplicate data items of each key will be returned in reverse order before
     /// moving on to the next key.
     fn iter_end_backwards(&mut self) -> Iter<'txn> {
-        Iter::new(self.cursor(), ffi::MDB_LAST, ffi::MDB_PREV)
+        Iter::new(self.cursor(), ffi::MDB_LAST, ffi::MDB_PREV, Bound::Unbounded)
     }
 
     /// Iterate over database items starting from the given key.
@@ -103,7 +107,39 @@ pub trait Cursor<'txn> {
             Ok(_) | Err(Error::NotFound) => (),
             Err(error) => return Iter::Err(error),
         };
-        Iter::new(self.cursor(), ffi::MDB_GET_CURRENT, ffi::MDB_NEXT)
+        Iter::new(self.cursor(), ffi::MDB_GET_CURRENT, ffi::MDB_NEXT, Bound::Unbounded)
+    }
+
+    /// Iterate over a `range` of database items.
+    ///
+    /// For databases with duplicate data items (`DatabaseFlags::DUP_SORT`), the
+    /// duplicate data items of each key will be returned before moving on to
+    /// the next key.
+    fn iter_range<K, R>(&mut self, range: R) -> Iter<'txn>
+    where
+        K: AsRef<[u8]>,
+        R: RangeBounds<K>,
+    {
+        let (start, first_op) = match range.start_bound() {
+            Bound::Excluded(k) | Bound::Included(k) => (Some(k.as_ref()), ffi::MDB_SET_RANGE),
+            Bound::Unbounded => (None, ffi::MDB_FIRST),
+        };
+
+        let end = match range.end_bound() {
+            Bound::Excluded(k) => Bound::Excluded(k.as_ref().into()),
+            Bound::Included(k) => Bound::Included(k.as_ref().into()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        let op = match self.get(start, None, first_op) {
+            Ok((Some(key), _)) => match range.start_bound() {
+                Bound::Excluded(k) if k.as_ref() == key => ffi::MDB_NEXT,
+                _ => ffi::MDB_GET_CURRENT,
+            },
+            Ok((None, _)) | Err(Error::NotFound) => ffi::MDB_GET_CURRENT,
+            Err(error) => return Iter::Err(error),
+        };
+        Iter::new(self.cursor(), op, ffi::MDB_NEXT, end)
     }
 
     /// Iterate over duplicate database items. The iterator will begin with the
@@ -155,11 +191,11 @@ pub trait Cursor<'txn> {
             Ok(_) => (),
             Err(Error::NotFound) => {
                 self.get(None, None, ffi::MDB_LAST).ok();
-                return Iter::new(self.cursor(), ffi::MDB_NEXT, ffi::MDB_NEXT);
+                return Iter::new(self.cursor(), ffi::MDB_NEXT, ffi::MDB_NEXT, Bound::Unbounded);
             },
             Err(error) => return Iter::Err(error),
         };
-        Iter::new(self.cursor(), ffi::MDB_GET_CURRENT, ffi::MDB_NEXT_DUP)
+        Iter::new(self.cursor(), ffi::MDB_GET_CURRENT, ffi::MDB_NEXT_DUP, Bound::Unbounded)
     }
 }
 
@@ -317,6 +353,9 @@ pub enum Iter<'txn> {
         /// The next and subsequent operations to perform.
         next_op: c_uint,
 
+        /// Upper bound.
+        bound: Bound<Box<[u8]>>,
+
         /// A marker to ensure the iterator doesn't outlive the transaction.
         _marker: PhantomData<fn(&'txn ())>,
     },
@@ -324,11 +363,12 @@ pub enum Iter<'txn> {
 
 impl<'txn> Iter<'txn> {
     /// Creates a new iterator backed by the given cursor.
-    fn new<'t>(cursor: *mut ffi::MDB_cursor, op: c_uint, next_op: c_uint) -> Iter<'t> {
+    fn new<'t>(cursor: *mut ffi::MDB_cursor, op: c_uint, next_op: c_uint, bound: Bound<Box<[u8]>>) -> Iter<'t> {
         Iter::Ok {
             cursor,
             op,
             next_op,
+            bound,
             _marker: PhantomData,
         }
     }
@@ -349,6 +389,7 @@ impl<'txn> Iterator for Iter<'txn> {
                 cursor,
                 ref mut op,
                 next_op,
+                ref bound,
                 _marker,
             } => {
                 let mut key = ffi::MDB_val {
@@ -362,7 +403,20 @@ impl<'txn> Iterator for Iter<'txn> {
                 let op = mem::replace(op, next_op);
                 unsafe {
                     match ffi::mdb_cursor_get(cursor, &mut key, &mut data, op) {
-                        ffi::MDB_SUCCESS => Some(Ok((val_to_slice(key), val_to_slice(data)))),
+                        ffi::MDB_SUCCESS => {
+                            let key = val_to_slice(key);
+                            let in_range = match bound {
+                                Bound::Excluded(b) => key < b.as_ref(),
+                                Bound::Included(b) => key <= b.as_ref(),
+                                Bound::Unbounded => true,
+                            };
+
+                            if in_range {
+                                Some(Ok((key, val_to_slice(data))))
+                            } else {
+                                None
+                            }
+                        },
                         // EINVAL can occur when the cursor was previously seeked to a non-existent value,
                         // e.g. iter_from with a key greater than all values in the database.
                         ffi::MDB_NOTFOUND | EINVAL => None,
@@ -465,6 +519,7 @@ impl<'txn> Iterator for IterDup<'txn> {
                             Direction::Forwards => ffi::MDB_NEXT_DUP,
                             Direction::Backwards => ffi::MDB_PREV_DUP,
                         },
+                        Bound::Unbounded,
                     ))
                 } else {
                     None
@@ -819,5 +874,87 @@ mod test {
 
         cursor.del(WriteFlags::empty()).unwrap();
         assert_eq!((Some(&b"key2"[..]), &b"val2"[..]), cursor.get(None, None, MDB_LAST).unwrap());
+    }
+
+    #[test]
+    fn test_iter_range() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"key1", b"val1"), (b"key2", b"val2"), (b"key3", b"val3"), (b"key5", b"val5")];
+
+        let mut txn = env.begin_rw_txn().unwrap();
+        for (key, data) in &items {
+            txn.put(db, key, data, WriteFlags::empty()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro_txn().unwrap();
+        let mut cursor = txn.open_ro_cursor(db).unwrap();
+
+        // Range bounded inclusively below and above
+        assert_eq!(
+            items.clone().into_iter().skip(1).take(2).collect::<Vec<_>>(),
+            cursor.iter_range(&b"key2"[..]..=b"key3").collect::<Result<Vec<_>>>().unwrap()
+        );
+
+        // Range bounded inclusively below and exclusively above
+        assert_eq!(
+            items.clone().into_iter().skip(1).take(1).collect::<Vec<_>>(),
+            cursor.iter_range(&b"key2"[..]..b"key3").collect::<Result<Vec<_>>>().unwrap()
+        );
+
+        // Range bounded exclusively below and above
+        assert_eq!(
+            items.clone().into_iter().skip(4).collect::<Vec<_>>(),
+            cursor
+                .iter_range::<&[u8; 4], _>((Bound::Excluded(b"key2"), Bound::Excluded(b"key3")))
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+        );
+
+        // Range bounded exclusively below and inclusively above
+        assert_eq!(
+            items.clone().into_iter().skip(2).take(1).collect::<Vec<_>>(),
+            cursor
+                .iter_range::<&[u8; 4], _>((Bound::Excluded(b"key2"), Bound::Included(b"key3")))
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+        );
+
+        // Range only bounded exclusively below
+        assert_eq!(
+            items.clone().into_iter().skip(2).collect::<Vec<_>>(),
+            cursor
+                .iter_range::<&[u8; 4], _>((Bound::Excluded(b"key2"), Bound::Unbounded))
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+        );
+
+        // Range only bounded inclusively below
+        assert_eq!(
+            items.clone().into_iter().skip(1).collect::<Vec<_>>(),
+            cursor.iter_range(&b"key2"[..]..).collect::<Result<Vec<_>>>().unwrap()
+        );
+
+        // Range only bounded exclusively above
+        assert_eq!(
+            items.clone().into_iter().take(3).collect::<Vec<_>>(),
+            cursor.iter_range(..&b"key5"[..]).collect::<Result<Vec<_>>>().unwrap()
+        );
+
+        // Range only bounded inclusively above
+        assert_eq!(
+            items.clone().into_iter().take(3).collect::<Vec<_>>(),
+            cursor.iter_range(..=&b"key3"[..]).collect::<Result<Vec<_>>>().unwrap()
+        );
+
+        // Unbounded range
+        assert_eq!(
+            items.clone().into_iter().collect::<Vec<_>>(),
+            cursor.iter_range::<&[u8], _>(..).collect::<Result<Vec<_>>>().unwrap()
+        );
     }
 }
