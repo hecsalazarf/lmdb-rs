@@ -2,9 +2,11 @@ use libc::{
     c_uint,
     size_t,
 };
-use std::ffi::CString;
-#[cfg(windows)]
 use std::ffi::OsStr;
+use std::ffi::{
+    CStr,
+    CString,
+};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -45,11 +47,17 @@ use transaction::{
 /// Adding a 'missing' trait from windows OsStrExt
 trait OsStrExtLmdb {
     fn as_bytes(&self) -> &[u8];
+    fn from_bytes(bytes: &[u8]) -> &OsStr;
 }
 #[cfg(windows)]
 impl OsStrExtLmdb for OsStr {
     fn as_bytes(&self) -> &[u8] {
         &self.to_str().unwrap().as_bytes()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> &OsStr {
+        let st = ::std::str::from_utf8(bytes).expect("str from cstr bytes");
+        OsStr::new(st)
     }
 }
 
@@ -283,6 +291,18 @@ impl Environment {
     {
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).map_err(|_| ::Error::Invalid)?;
         unsafe { lmdb_result(ffi::mdb_env_copy2(self.env(), path.as_ptr(), flags.bits())) }
+    }
+
+    /// Return the path that was used to open the environment.
+    pub fn get_path(&self) -> Result<&Path> {
+        let mut ptr = ptr::null();
+        let cstr = unsafe {
+            lmdb_result(ffi::mdb_env_get_path(self.env(), &mut ptr))?;
+            CStr::from_ptr(ptr)
+        };
+
+        let osstr = OsStr::from_bytes(cstr.to_bytes());
+        Ok(Path::new(osstr))
     }
 }
 
@@ -743,5 +763,12 @@ mod test {
         assert_eq!(buffer, buffer_copy);
         // The compacted copy is smaller than the default one
         assert!(buffer_copy_comp < buffer_copy);
+    }
+
+    #[test]
+    fn test_get_path() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        assert_eq!(Ok(dir.path()), env.get_path());
     }
 }
